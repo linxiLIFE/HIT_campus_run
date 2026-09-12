@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate and optionally play a paced GPX route around HIT Campus I.
+"""Generate and optionally play paced GPX routes around HIT campuses.
 
-The route geometry is an embedded, reproducible copy of the inner ring of
-OpenStreetMap way 319275785, part of relation 4434603.  The points are only a
-GPS/Core Location simulation; this program does not inject accelerometer data,
-steps, HealthKit data, or any third-party app's activity record.
+The supported route geometries are embedded, reproducible copies of public
+OpenStreetMap track boundaries for HIT Campus I and Campus II.  The points are
+only a GPS/Core Location simulation; this program does not inject accelerometer
+data, steps, HealthKit data, or any third-party app's activity record.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import bisect
 import datetime as dt
 import math
 import random
+import secrets
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -67,21 +68,137 @@ TRACK_INNER_RING_LATLON: tuple[tuple[float, float], ...] = (
     (45.7370092, 126.6275568),
 )
 
+# Public source: OpenStreetMap relation 8914003, inner way 643311728.
+# Retrieved 2026-09-12.  This is the inner boundary of the running track
+# mapped inside HIT Campus II; the route is shifted into the track surface.
+CAMPUS_II_INNER_RING_LATLON: tuple[tuple[float, float], ...] = (
+    (45.7571458, 126.6783290),
+    (45.7562692, 126.6785519),
+    (45.7561803, 126.6786334),
+    (45.7561186, 126.6787218),
+    (45.7560717, 126.6788599),
+    (45.7560618, 126.6789979),
+    (45.7560816, 126.6791501),
+    (45.7561433, 126.6793023),
+    (45.7562272, 126.6793872),
+    (45.7563161, 126.6794474),
+    (45.7563877, 126.6794757),
+    (45.7572619, 126.6792562),
+    (45.7573557, 126.6791784),
+    (45.7574224, 126.6790545),
+    (45.7574668, 126.6788917),
+    (45.7574767, 126.6787501),
+    (45.7574545, 126.6786192),
+    (45.7573903, 126.6784989),
+    (45.7573310, 126.6784210),
+    (45.7572594, 126.6783608),
+    (45.7571458, 126.6783290),
+)
+
 TARGET_MIN_PACE_SECONDS = 4 * 60 + 30
 TARGET_MAX_PACE_SECONDS = 5 * 60 + 30
 METERS_PER_DEGREE_LAT = 111_320.0
-LAT0 = sum(point[0] for point in TRACK_INNER_RING_LATLON) / len(
-    TRACK_INNER_RING_LATLON
-)
-LON0 = sum(point[1] for point in TRACK_INNER_RING_LATLON) / len(
-    TRACK_INNER_RING_LATLON
-)
-METERS_PER_DEGREE_LON = METERS_PER_DEGREE_LAT * math.cos(math.radians(LAT0))
 GPX_NS = "http://www.topografix.com/GPX/1/1"
-TRACK_LANE_BASELINE_OFFSET = -10.0
 
 
 Point = tuple[float, float]
+
+
+@dataclass(frozen=True)
+class CampusRoute:
+    """Static metadata and geometry for one supported HIT campus route."""
+
+    key: str
+    name_zh: str
+    name_en: str
+    track_points: tuple[tuple[float, float], ...]
+    source_label: str
+    source_urls: tuple[str, ...]
+    baseline_offset: float
+    lane_bias_limit: float
+    lateral_shift_limit: float
+    default_output: Path
+
+
+CAMPUS_ROUTES: dict[str, CampusRoute] = {
+    "campus1": CampusRoute(
+        key="campus1",
+        name_zh="哈工大一校区体育场",
+        name_en="HIT Campus I athletics track",
+        track_points=TRACK_INNER_RING_LATLON,
+        source_label="OpenStreetMap relation 4434603 / way 319275785",
+        source_urls=(
+            "https://www.openstreetmap.org/relation/4434603",
+            "https://www.openstreetmap.org/way/319275785",
+        ),
+        baseline_offset=-10.0,
+        lane_bias_limit=1.4,
+        lateral_shift_limit=1.8,
+        default_output=Path("routes/hit_campus_2_2km.gpx"),
+    ),
+    "campus2": CampusRoute(
+        key="campus2",
+        name_zh="哈工大二校区田径场",
+        name_en="HIT Campus II running track",
+        track_points=CAMPUS_II_INNER_RING_LATLON,
+        source_label="OpenStreetMap relation 8914003 / inner way 643311728",
+        source_urls=(
+            "https://www.openstreetmap.org/relation/8914003",
+            "https://www.openstreetmap.org/way/643311728",
+        ),
+        # The Campus II inner way is ordered in the opposite direction from
+        # Campus I, so the positive normal points from the field into the
+        # running lanes here.
+        baseline_offset=5.5,
+        lane_bias_limit=1.0,
+        lateral_shift_limit=1.2,
+        default_output=Path("routes/hit_campus_ii_2_2km.gpx"),
+    ),
+}
+
+CAMPUS_ALIASES = {
+    "1": "campus1",
+    "i": "campus1",
+    "campusi": "campus1",
+    "campus1": "campus1",
+    "一校区": "campus1",
+    "2": "campus2",
+    "ii": "campus2",
+    "campusii": "campus2",
+    "campus2": "campus2",
+    "二校区": "campus2",
+}
+
+
+@dataclass(frozen=True)
+class LocalProjection:
+    """Small local metre projection centred on one campus track."""
+
+    lat0: float
+    lon0: float
+    meters_per_degree_lon: float
+
+    @classmethod
+    def from_points(cls, points: Sequence[tuple[float, float]]) -> "LocalProjection":
+        if not points:
+            raise ValueError("路线至少需要 1 个经纬度点")
+        lat0 = sum(point[0] for point in points) / len(points)
+        lon0 = sum(point[1] for point in points) / len(points)
+        meters_per_degree_lon = METERS_PER_DEGREE_LAT * math.cos(math.radians(lat0))
+        return cls(lat0, lon0, meters_per_degree_lon)
+
+    def to_xy(self, lat: float, lon: float) -> Point:
+        return (
+            (lon - self.lon0) * self.meters_per_degree_lon,
+            (lat - self.lat0) * METERS_PER_DEGREE_LAT,
+        )
+
+    def to_latlon(self, point: Point) -> tuple[float, float]:
+        x, y = point
+        return (
+            self.lat0 + y / METERS_PER_DEGREE_LAT,
+            self.lon0 + x / self.meters_per_degree_lon,
+        )
 
 
 @dataclass(frozen=True)
@@ -100,6 +217,25 @@ class GeneratedRoute:
     distances: tuple[float, ...]
     lap_spans: tuple[LapSpan, ...]
     loop_length: float
+    start_offset: float
+
+
+@dataclass(frozen=True)
+class RouteVariation:
+    """Randomized but seedable route characteristics for one generation."""
+
+    lane_biases: tuple[float, ...] = (0.0,)
+    lap_paces: tuple[float, ...] = ()
+    lateral_shift: float = 0.0
+    wave_phase: float = 0.7
+    wave_amplitude: float = 0.45
+    harmonic_phase: float = 1.4
+    harmonic_amplitude: float = 0.18
+    pace_phase: float = 0.5
+    pace_amplitude: float = 0.022
+    pace_harmonic_phase: float = 1.1
+    pace_harmonic_amplitude: float = 0.008
+    curve_slowdown: float = 0.025
 
 
 def parse_pace(value: str) -> float:
@@ -138,21 +274,6 @@ def format_pace(seconds_per_km: float) -> str:
     return f"{total_seconds // 60}:{total_seconds % 60:02d}/km"
 
 
-def latlon_to_xy(lat: float, lon: float) -> Point:
-    return (
-        (lon - LON0) * METERS_PER_DEGREE_LON,
-        (lat - LAT0) * METERS_PER_DEGREE_LAT,
-    )
-
-
-def xy_to_latlon(point: Point) -> tuple[float, float]:
-    x, y = point
-    return (
-        LAT0 + y / METERS_PER_DEGREE_LAT,
-        LON0 + x / METERS_PER_DEGREE_LON,
-    )
-
-
 def distance(a: Point, b: Point) -> float:
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
@@ -180,10 +301,11 @@ def smoothstep(value: float) -> float:
 class ClosedPolyline:
     """Distance-addressable closed polyline in a local metre projection."""
 
-    def __init__(self, points: Sequence[Point]) -> None:
+    def __init__(self, points: Sequence[Point], projection: LocalProjection) -> None:
         if len(points) < 3:
             raise ValueError("操场轮廓至少需要 3 个点")
         self.points = tuple(points)
+        self.projection = projection
         self.segment_lengths = tuple(
             distance(self.points[index], self.points[(index + 1) % len(self.points)])
             for index in range(len(self.points))
@@ -210,26 +332,45 @@ class ClosedPolyline:
         return unit((after[0] - before[0], after[1] - before[1]))
 
 
-def track_loop() -> ClosedPolyline:
-    # The source way is ordered counter-clockwise.  The right-hand normal of
-    # this inner boundary points into the running lanes, away from the field.
-    points = [latlon_to_xy(*point) for point in TRACK_INNER_RING_LATLON]
+def parse_campus(value: str) -> str:
+    """Normalize a campus name or a short numeric alias."""
+
+    normalized = (
+        value.strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+    )
+    try:
+        return CAMPUS_ALIASES[normalized]
+    except KeyError as exc:
+        choices = "、".join(("campus1", "campus2"))
+        raise argparse.ArgumentTypeError(
+            f"无法识别校区 {value!r}，请使用 {choices}"
+        ) from exc
+
+
+def track_loop(campus: CampusRoute) -> ClosedPolyline:
+    projection = LocalProjection.from_points(campus.track_points)
+    points = [projection.to_xy(*point) for point in campus.track_points]
     if distance(points[0], points[-1]) < 0.01:
         points.pop()
-    return ClosedPolyline(points)
+    return ClosedPolyline(points, projection)
 
 
 def lane_offset(
     loop: ClosedPolyline,
     local_distance: float,
     lap_index: int,
-    lane_biases: Sequence[float],
-    baseline_offset: float = TRACK_LANE_BASELINE_OFFSET,
+    variation: RouteVariation,
+    baseline_offset: float,
+    start_offset: float = 0.0,
 ) -> Point:
     """Return a point with a small, continuous per-lap lane deviation."""
 
-    previous_bias = lane_biases[lap_index - 1] if lap_index else lane_biases[lap_index]
-    current_bias = lane_biases[lap_index]
+    previous_bias = (
+        variation.lane_biases[lap_index - 1]
+        if lap_index
+        else variation.lane_biases[lap_index]
+    )
+    current_bias = variation.lane_biases[lap_index]
     transition_length = min(55.0, loop.length * 0.15)
     if local_distance < transition_length:
         transition = smoothstep(local_distance / transition_length)
@@ -238,28 +379,51 @@ def lane_offset(
         bias = current_bias
 
     # The wave is the same at the lap boundary, so changing lane does not
-    # create a teleporting jump at the start/finish line.
-    wave = 0.45 * math.sin(2 * math.pi * local_distance / loop.length + 0.7)
-    wave += 0.18 * math.sin(4 * math.pi * local_distance / loop.length + 1.4)
-    offset = baseline_offset + bias + wave
-    tangent = loop.tangent(local_distance)
-    # For this mapped boundary, the right normal points toward the outside
-    # edge.  A negative baseline therefore moves the route back into the
-    # visible red running lanes, instead of onto the outer apron.
+    # create a teleporting jump at the start/finish line.  The phase is based
+    # on the ring position, while the lane transition is based on local lap
+    # distance.
+    ring_distance = start_offset + local_distance
+    wave = variation.wave_amplitude * math.sin(
+        2 * math.pi * ring_distance / loop.length + variation.wave_phase
+    )
+    wave += variation.harmonic_amplitude * math.sin(
+        4 * math.pi * ring_distance / loop.length + variation.harmonic_phase
+    )
+    offset = baseline_offset + variation.lateral_shift + bias + wave
+    tangent = loop.tangent(ring_distance)
+    # The sign is configured per campus because the source way direction can
+    # differ.  It always moves from the field-side boundary into the lanes.
     right_normal = (tangent[1], -tangent[0])
-    return add(loop.at(local_distance), scale(right_normal, offset))
+    return add(loop.at(ring_distance), scale(right_normal, offset))
 
 
-def generated_loop_length(loop: ClosedPolyline, sample_step: float = 1.0) -> float:
+def generated_loop_length(
+    loop: ClosedPolyline,
+    baseline_offset: float,
+    variation: RouteVariation | None = None,
+    sample_step: float = 1.0,
+    start_offset: float = 0.0,
+) -> float:
     """Estimate the length of one generated centre-line lap."""
 
+    variation = variation or RouteVariation()
     positions = [
         min(index * sample_step, loop.length)
         for index in range(int(loop.length / sample_step) + 1)
     ]
     if not positions or positions[-1] < loop.length:
         positions.append(loop.length)
-    points = [lane_offset(loop, position, 0, (0.0,)) for position in positions]
+    points = [
+        lane_offset(
+            loop,
+            position,
+            0,
+            variation,
+            baseline_offset,
+            start_offset,
+        )
+        for position in positions
+    ]
     return sum(distance(a, b) for a, b in zip(points, points[1:]))
 
 
@@ -270,8 +434,10 @@ def interpolate_segment(a: Point, b: Point, fraction: float) -> Point:
 def build_route(
     loop: ClosedPolyline,
     target_distance: float,
-    lane_biases: Sequence[float],
+    variation: RouteVariation,
+    baseline_offset: float,
     sample_step: float = 1.0,
+    start_offset: float = 0.0,
 ) -> GeneratedRoute:
     if target_distance <= 0:
         raise ValueError("总距离必须大于 0")
@@ -281,7 +447,7 @@ def build_route(
     spans: list[LapSpan] = []
     total = 0.0
 
-    for lap_index, _ in enumerate(lane_biases):
+    for lap_index, _ in enumerate(variation.lane_biases):
         # Build a complete mapped lap and truncate the final segment by the
         # requested distance.  The inward offset changes physical metres per
         # metre of source-ring distance, so using the remaining distance as a
@@ -294,7 +460,14 @@ def build_route(
         if not local_positions or local_positions[-1] < lap_target:
             local_positions.append(lap_target)
         lap_points = [
-            lane_offset(loop, local, lap_index, lane_biases)
+            lane_offset(
+                loop,
+                local,
+                lap_index,
+                variation,
+                baseline_offset,
+                start_offset,
+            )
             for local in local_positions
         ]
         lap_start = total
@@ -341,6 +514,7 @@ def build_route(
         distances=tuple(route_distances),
         lap_spans=tuple(spans),
         loop_length=loop.length,
+        start_offset=start_offset,
     )
 
 
@@ -370,8 +544,7 @@ def route_local_distance(route: GeneratedRoute, travelled: float, span: LapSpan)
 def pace_profile(
     route: GeneratedRoute,
     loop: ClosedPolyline,
-    lap_paces: Sequence[float],
-    sample_step: float = 1.0,
+    variation: RouteVariation,
 ) -> tuple[list[float], list[float]]:
     """Build cumulative time at each route sample and the instantaneous speed."""
 
@@ -385,18 +558,26 @@ def pace_profile(
         span = span_at(route, midpoint)
         local = route_local_distance(route, midpoint, span)
         lap_fraction = local / max(0.001, loop.length)
-        speed = 1000.0 / lap_paces[span.index]
-        speed *= 1.0 + 0.022 * math.sin(2 * math.pi * lap_fraction + 0.5)
-        speed *= 1.0 + 0.008 * math.sin(4 * math.pi * lap_fraction + 1.1)
+        speed = 1000.0 / variation.lap_paces[span.index]
+        speed *= 1.0 + variation.pace_amplitude * math.sin(
+            2 * math.pi * lap_fraction + variation.pace_phase
+        )
+        speed *= 1.0 + variation.pace_harmonic_amplitude * math.sin(
+            4 * math.pi * lap_fraction + variation.pace_harmonic_phase
+        )
 
         # Ease off a little on the two bends, then return to cruising speed.
-        before = loop.tangent(local - 7.0)
-        after = loop.tangent(local + 7.0)
+        ring_distance = route.start_offset + local
+        before = loop.tangent(ring_distance - 7.0)
+        after = loop.tangent(ring_distance + 7.0)
         angle = abs(
-            math.atan2(before[0] * after[1] - before[1] * after[0], before[0] * after[0] + before[1] * after[1])
+            math.atan2(
+                before[0] * after[1] - before[1] * after[0],
+                before[0] * after[0] + before[1] * after[1],
+            )
         )
         curve_factor = min(1.0, angle / (math.pi / 2))
-        speed *= 1.0 - 0.025 * curve_factor
+        speed *= 1.0 - variation.curve_slowdown * curve_factor
 
         speeds.append(speed)
         times.append(times[-1] + segment / speed)
@@ -406,14 +587,14 @@ def pace_profile(
 def timed_points(
     route: GeneratedRoute,
     loop: ClosedPolyline,
-    lap_paces: Sequence[float],
+    variation: RouteVariation,
     start_time: dt.datetime,
     sample_rate: float,
     gps_noise: float,
     rng: random.Random,
     duration_scale: float = 1.0,
 ) -> tuple[tuple[dt.datetime, float, float], ...]:
-    raw_times, _ = pace_profile(route, loop, lap_paces)
+    raw_times, _ = pace_profile(route, loop, variation)
     times = [value * duration_scale for value in raw_times]
     duration = times[-1]
     interval = 1.0 / sample_rate
@@ -443,7 +624,7 @@ def timed_points(
         noise_x = correlation * noise_x + innovation * rng.gauss(0.0, gps_noise)
         noise_y = correlation * noise_y + innovation * rng.gauss(0.0, gps_noise)
         measured = (point[0] + noise_x, point[1] + noise_y)
-        lat, lon = xy_to_latlon(measured)
+        lat, lon = loop.projection.to_latlon(measured)
         result.append((start_time + dt.timedelta(seconds=seconds), lat, lon))
     return tuple(result)
 
@@ -460,6 +641,8 @@ def parse_start_time(value: str | None) -> dt.datetime:
 def write_gpx(
     output: Path,
     points: Iterable[tuple[dt.datetime, float, float]],
+    campus: CampusRoute,
+    seed: int,
 ) -> None:
     ET.register_namespace("", GPX_NS)
     root = ET.Element(
@@ -468,10 +651,16 @@ def write_gpx(
     )
     metadata = ET.SubElement(root, f"{{{GPX_NS}}}metadata")
     name = ET.SubElement(metadata, f"{{{GPX_NS}}}name")
-    name.text = "HIT Campus I athletics track · 2.2 km test route"
+    name.text = f"{campus.name_en} · generated GPX route"
+    description = ET.SubElement(metadata, f"{{{GPX_NS}}}desc")
+    description.text = (
+        f"Generated by hit_run_simulator.py; seed={seed}; "
+        f"source={campus.source_label}; links={', '.join(campus.source_urls)}; "
+        "OSM data is ODbL."
+    )
     track = ET.SubElement(root, f"{{{GPX_NS}}}trk")
     track_name = ET.SubElement(track, f"{{{GPX_NS}}}name")
-    track_name.text = "HIT Campus I track simulation"
+    track_name.text = f"{campus.name_en} simulation"
     segment = ET.SubElement(track, f"{{{GPX_NS}}}trkseg")
     for timestamp, lat, lon in points:
         track_point = ET.SubElement(
@@ -585,7 +774,50 @@ def create_lap_paces(
     return values
 
 
+def create_route_variation(
+    count: int,
+    target_pace: float,
+    campus: CampusRoute,
+    rng: random.Random,
+) -> RouteVariation:
+    """Create one route variation from a caller-provided random stream."""
+
+    # Use independent streams for count-dependent arrays.  If distance
+    # correction temporarily asks for one more lap, the already generated
+    # laps and the global shape parameters must stay unchanged.
+    stream_seed = rng.getrandbits(63)
+    lane_rng = random.Random(stream_seed + 1)
+    pace_rng = random.Random(stream_seed + 2)
+    shape_rng = random.Random(stream_seed + 3)
+    return RouteVariation(
+        lane_biases=tuple(
+            lane_rng.uniform(-campus.lane_bias_limit, campus.lane_bias_limit)
+            for _ in range(count)
+        ),
+        lap_paces=tuple(create_lap_paces(count, target_pace, pace_rng)),
+        lateral_shift=shape_rng.uniform(
+            -campus.lateral_shift_limit, campus.lateral_shift_limit
+        ),
+        wave_phase=shape_rng.uniform(0.0, 2.0 * math.pi),
+        wave_amplitude=shape_rng.uniform(0.30, 0.60),
+        harmonic_phase=shape_rng.uniform(0.0, 2.0 * math.pi),
+        harmonic_amplitude=shape_rng.uniform(0.10, 0.24),
+        pace_phase=shape_rng.uniform(0.0, 2.0 * math.pi),
+        pace_amplitude=shape_rng.uniform(0.014, 0.026),
+        pace_harmonic_phase=shape_rng.uniform(0.0, 2.0 * math.pi),
+        pace_harmonic_amplitude=shape_rng.uniform(0.004, 0.012),
+        curve_slowdown=shape_rng.uniform(0.018, 0.032),
+    )
+
+
+def resolve_seed(value: int | None) -> int:
+    """Return an explicit seed or fresh OS entropy for the default case."""
+
+    return value if value is not None else secrets.randbits(63)
+
+
 def generate_timed_route(
+    campus: CampusRoute,
     loop: ClosedPolyline,
     target_distance: float,
     target_pace: float,
@@ -594,36 +826,56 @@ def generate_timed_route(
     gps_noise: float,
     seed: int,
 ) -> tuple[GeneratedRoute, tuple[tuple[dt.datetime, float, float], ...], float]:
-    """Generate a route whose *sampled GPX distance* matches the target.
+    """Generate a route whose *sampled GPX distance* stays near the target.
 
     A logger measures straight chords between timestamped fixes.  Chords cut a
     few metres from tight bends, so the clean geometric route needs to be a
     little longer than the distance displayed by a 1 Hz logger.  Repeating the
     deterministic build with a small correction keeps the final GPX near the
-    requested distance while retaining the real mapped shape.
+    requested distance while retaining the real mapped shape.  All random
+    choices come from ``seed``, so an explicit seed can reproduce the route.
     """
 
     source_distance = target_distance
     start_time = start_time.astimezone(dt.timezone.utc)
     expected_duration = target_distance * target_pace / 1000.0
-    estimated_run_lap_length = generated_loop_length(loop)
-    for _ in range(5):
+    start_offset = random.Random(seed + 5).uniform(0.0, loop.length)
+    estimated_run_lap_length = generated_loop_length(
+        loop,
+        campus.baseline_offset,
+        start_offset=start_offset,
+    )
+    best_route: GeneratedRoute | None = None
+    best_timed: tuple[tuple[dt.datetime, float, float], ...] = ()
+    best_generated_length = estimated_run_lap_length
+    best_error = math.inf
+    for _ in range(10):
         lap_count = math.ceil(source_distance / estimated_run_lap_length) + 1
-        # Advance a separate stream per lap so changing the number of laps
-        # does not alter the already generated lane deviations.
-        lane_biases = [
-            random.Random(seed + 11 + index).uniform(-1.4, 1.4)
-            for index in range(lap_count)
-        ]
-        pace_rng = random.Random(seed + 23)
-        lap_paces = create_lap_paces(lap_count, target_pace, pace_rng)
-        route = build_route(loop, source_distance, lane_biases)
-        raw_times, _ = pace_profile(route, loop, lap_paces)
+        variation = create_route_variation(
+            lap_count,
+            target_pace,
+            campus,
+            random.Random(seed + 23),
+        )
+        route = build_route(
+            loop,
+            source_distance,
+            variation,
+            campus.baseline_offset,
+            start_offset=start_offset,
+        )
+        generated_length = generated_loop_length(
+            loop,
+            campus.baseline_offset,
+            variation,
+            start_offset=start_offset,
+        )
+        raw_times, _ = pace_profile(route, loop, variation)
         duration_scale = expected_duration / max(0.001, raw_times[-1])
         timed = timed_points(
             route=route,
             loop=loop,
-            lap_paces=lap_paces,
+            variation=variation,
             start_time=start_time,
             sample_rate=sample_rate,
             gps_noise=gps_noise,
@@ -631,22 +883,36 @@ def generate_timed_route(
             duration_scale=duration_scale,
         )
         measured = gpx_distance([(lat, lon) for _, lat, lon in timed])
-        if abs(measured - target_distance) <= 0.25:
-            return route, timed, estimated_run_lap_length
+        error = abs(measured - target_distance)
+        if error < best_error:
+            best_route = route
+            best_timed = timed
+            best_generated_length = generated_length
+            best_error = error
+        if error <= 0.25:
+            return route, timed, generated_length
         source_distance *= target_distance / max(0.001, measured)
 
-    return route, timed, estimated_run_lap_length
+    if best_route is None:
+        raise RuntimeError("无法生成路线")
+    return best_route, best_timed, best_generated_length
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="生成哈工大一校区体育场 2.2 km 环线 GPX，并可用 pymobiledevice3 播放。"
+        description="生成哈工大一校区或二校区田径场 GPX，并可用 pymobiledevice3 播放。"
+    )
+    parser.add_argument(
+        "--campus",
+        type=parse_campus,
+        default="campus1",
+        help="路线校区：campus1/一校区 或 campus2/二校区，默认 campus1",
     )
     parser.add_argument("--distance", type=float, default=2200.0, help="总距离，单位米，默认 2200")
     parser.add_argument("--pace", type=parse_pace, default=parse_pace("5:00"), help="目标配速，如 5:00、4.50、5.5")
-    parser.add_argument("--output", "-o", type=Path, default=Path("routes/hit_campus_2_2km.gpx"), help="输出 GPX 路径")
+    parser.add_argument("--output", "-o", type=Path, help="输出 GPX 路径；省略时按校区使用 routes/ 下的默认文件名")
     parser.add_argument("--start", help="起始时间，ISO 8601；省略则使用当前 UTC 时间")
-    parser.add_argument("--seed", type=int, default=20260912, help="随机种子，默认固定以便复现")
+    parser.add_argument("--seed", type=int, help="随机种子；省略时每次使用新的系统随机种子，并在输出中打印")
     parser.add_argument("--sample-rate", type=float, default=1.0, help="GPX 采样频率，默认 1 Hz")
     parser.add_argument("--gps-noise", type=float, default=0.8, help="相关 GPS 噪声标准差，单位米")
     parser.add_argument("--play", action="store_true", help="生成后调用 pymobiledevice3 播放")
@@ -670,19 +936,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.gps_noise < 0:
         parser.error("--gps-noise 不能为负数")
 
-    loop = track_loop()
+    campus = CAMPUS_ROUTES[args.campus]
+    output = args.output or campus.default_output
+    seed = resolve_seed(args.seed)
+    loop = track_loop(campus)
     route, timed, estimated_run_lap_length = generate_timed_route(
+        campus=campus,
         loop=loop,
         target_distance=args.distance,
         target_pace=args.pace,
         start_time=parse_start_time(args.start),
         sample_rate=args.sample_rate,
         gps_noise=args.gps_noise,
-        seed=args.seed,
+        seed=seed,
     )
-    write_gpx(args.output, timed)
+    write_gpx(output, timed, campus, seed)
 
-    count, measured_distance, duration = validate_gpx(args.output)
+    count, measured_distance, duration = validate_gpx(output)
     actual_pace = duration / max(0.001, measured_distance) * 1000
     full_spans = [
         span
@@ -698,7 +968,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.distance
         - sum(span.end_distance - span.start_distance for span in full_spans),
     )
-    print(f"已生成：{args.output.resolve()}")
+    print(f"校区：{campus.name_zh}（{campus.name_en}）")
+    print(f"数据来源：{campus.source_label}")
+    print(f"随机种子：{seed}（使用 --seed {seed} 可复现路线变化）")
+    print(f"起点在环线上的偏移：{route.start_offset:.1f} m")
+    print(f"已生成：{output.resolve()}")
     print(f"公开内圈轮廓长度：{loop.length:.1f} m")
     print(f"生成跑线估算圈长：{estimated_run_lap_length:.1f} m")
     print(f"路线结构：{full_laps} 圈 + {remainder:.1f} m")
@@ -707,7 +981,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("说明：GPX 只包含模拟 GPS 轨迹；不会增加 iPhone 系统步数或加速度计数据。")
 
     if args.play:
-        return play_location(args.output, args.keep_location_simulation)
+        return play_location(output, args.keep_location_simulation)
     return 0
 
 
