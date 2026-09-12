@@ -1,4 +1,4 @@
-# 哈工大田径场 GPX 路线生成器
+# 哈工大乐跑
 
 [English README](README.en.md)
 
