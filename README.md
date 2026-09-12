@@ -4,6 +4,10 @@
 
 这个小工具生成用于 iPhone Core Location/DVT 测试的 GPX 轨迹，当前支持：
 
+设备支持:
+iPhone (ios>=18) AND mac
+将iPhone通过数据线连接至mac，且iPhone开启开发者模式
+
 - 哈工大一校区体育场（默认）
 - 哈工大二校区田径场
 
@@ -123,8 +127,4 @@ python3 -m unittest -v
 
 地图数据是脚本内的静态缓存，田径场、校内通行规则和第三方 App 行为可能变化。实际使用前请自行确认场地和授权范围。
 
-## 公开仓库检查清单
 
-- 不要提交 `.venv/`、`__pycache__/` 或 `routes/*.gpx` 等本地产物。
-- 保留 OpenStreetMap 来源、ODbL 说明和本项目的使用边界。
-- 发布前根据自己的分发意图补充代码许可证；OSM 数据许可与代码许可证是两件事。
